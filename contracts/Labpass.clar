@@ -17,11 +17,21 @@
 (define-constant ERR-UNAUTHORIZED-ACCESS (err u108))
 (define-constant ERR-INVALID-LAB (err u109))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u110))
+(define-constant ERR-EQUIPMENT-NOT-FOUND (err u111))
+(define-constant ERR-EQUIPMENT-UNAVAILABLE (err u112))
+(define-constant ERR-RESERVATION-NOT-FOUND (err u113))
+(define-constant ERR-RESERVATION-CONFLICT (err u114))
+(define-constant ERR-INVALID-TIME-SLOT (err u115))
+(define-constant ERR-EQUIPMENT-MAINTENANCE (err u116))
+(define-constant ERR-RESERVATION-EXPIRED (err u117))
+(define-constant ERR-EQUIPMENT-INACTIVE (err u118))
 
 ;; data vars
 (define-data-var last-token-id uint u0)
 (define-data-var lab-count uint u0)
 (define-data-var commission uint u250)
+(define-data-var equipment-count uint u0)
+(define-data-var reservation-count uint u0)
 
 ;; data maps
 (define-map token-count principal uint)
@@ -49,6 +59,34 @@
   (tuple (access-time uint) (duration uint)))
 
 (define-map user-lab-history principal (list 100 uint))
+
+(define-map lab-equipment uint
+  (tuple
+    (name (string-ascii 64))
+    (lab-id uint)
+    (hourly-rate uint)
+    (available bool)
+    (maintenance-start uint)
+    (maintenance-end uint)
+    (max-reservation-hours uint)
+    (requires-training bool)))
+
+(define-map equipment-reservations uint
+  (tuple
+    (equipment-id uint)
+    (user principal)
+    (pass-id uint)
+    (start-time uint)
+    (end-time uint)
+    (total-cost uint)
+    (status uint)
+    (created-at uint)))
+
+(define-map user-reservations principal (list 50 uint))
+
+(define-map equipment-schedule 
+  (tuple (equipment-id uint) (time-slot uint))
+  (tuple (reserved bool) (reservation-id uint)))
 
 ;; public functions
 (define-public (create-lab (name (string-ascii 64)) (price-per-hour uint) (max-access-level uint))
@@ -173,6 +211,150 @@
     (map-set lab-passes pass-id (merge pass-info (tuple (expiry-block new-expiry))))
     (ok true)))
 
+(define-public (add-equipment (lab-id uint) (name (string-ascii 64)) (hourly-rate uint) (max-hours uint) (requires-training bool))
+  (let 
+    (
+      (equipment-id (+ (var-get equipment-count) u1))
+      (lab-info (unwrap! (map-get? labs lab-id) ERR-INVALID-LAB))
+    )
+    (asserts! (is-eq tx-sender (get owner lab-info)) ERR-NOT-TOKEN-OWNER)
+    (map-set lab-equipment equipment-id
+      (tuple
+        (name name)
+        (lab-id lab-id)
+        (hourly-rate hourly-rate)
+        (available true)
+        (maintenance-start u0)
+        (maintenance-end u0)
+        (max-reservation-hours max-hours)
+        (requires-training requires-training)))
+    (var-set equipment-count equipment-id)
+    (ok equipment-id)))
+
+(define-public (make-reservation (equipment-id uint) (pass-id uint) (start-time uint) (duration-hours uint))
+  (let 
+    (
+      (reservation-id (+ (var-get reservation-count) u1))
+      (equipment-info (unwrap! (map-get? lab-equipment equipment-id) ERR-EQUIPMENT-NOT-FOUND))
+      (pass-info (unwrap! (map-get? lab-passes pass-id) ERR-NFT-NOT-FOUND))
+      (lab-info (unwrap! (map-get? labs (get lab-id equipment-info)) ERR-INVALID-LAB))
+      (end-time (+ start-time (* duration-hours u144)))
+      (total-cost (* (get hourly-rate equipment-info) duration-hours))
+    )
+    (asserts! (is-eq (get owner pass-info) tx-sender) ERR-NOT-TOKEN-OWNER)
+    (asserts! (is-eq (get lab-id pass-info) (get lab-id equipment-info)) ERR-INVALID-LAB)
+    (asserts! (< stacks-block-height (get expiry-block pass-info)) ERR-PASS-EXPIRED)
+    (asserts! (get available equipment-info) ERR-EQUIPMENT-UNAVAILABLE)
+    (asserts! (not (is-in-maintenance equipment-id start-time end-time)) ERR-EQUIPMENT-MAINTENANCE)
+    (asserts! (<= duration-hours (get max-reservation-hours equipment-info)) ERR-INVALID-TIME-SLOT)
+    (asserts! (> start-time stacks-block-height) ERR-INVALID-TIME-SLOT)
+    (asserts! (is-time-slot-available equipment-id start-time end-time) ERR-RESERVATION-CONFLICT)
+    (try! (stx-transfer? total-cost tx-sender (get owner lab-info)))
+    (map-set equipment-reservations reservation-id
+      (tuple
+        (equipment-id equipment-id)
+        (user tx-sender)
+        (pass-id pass-id)
+        (start-time start-time)
+        (end-time end-time)
+        (total-cost total-cost)
+        (status u1)
+        (created-at stacks-block-height)))
+    (begin 
+      (block-time-slots equipment-id start-time end-time reservation-id)
+      (let 
+        (
+          (current-reservations (default-to (list) (map-get? user-reservations tx-sender)))
+        )
+        (map-set user-reservations tx-sender 
+          (unwrap-panic (as-max-len? (append current-reservations reservation-id) u50)))))
+    (var-set reservation-count reservation-id)
+    (ok reservation-id)))
+
+(define-public (cancel-reservation (reservation-id uint))
+  (let 
+    (
+      (reservation-info (unwrap! (map-get? equipment-reservations reservation-id) ERR-RESERVATION-NOT-FOUND))
+      (equipment-info (unwrap! (map-get? lab-equipment (get equipment-id reservation-info)) ERR-EQUIPMENT-NOT-FOUND))
+      (lab-info (unwrap! (map-get? labs (get lab-id equipment-info)) ERR-INVALID-LAB))
+      (refund-amount (if (> (get start-time reservation-info) (+ stacks-block-height u144))
+                      (get total-cost reservation-info)
+                      (/ (get total-cost reservation-info) u2)))
+    )
+    (asserts! (is-eq (get user reservation-info) tx-sender) ERR-NOT-TOKEN-OWNER)
+    (asserts! (is-eq (get status reservation-info) u1) ERR-RESERVATION-EXPIRED)
+    (asserts! (> (get start-time reservation-info) stacks-block-height) ERR-RESERVATION-EXPIRED)
+    (try! (stx-transfer? refund-amount (get owner lab-info) tx-sender))
+    (begin
+      (map-set equipment-reservations reservation-id 
+        (merge reservation-info (tuple (status u3))))
+      (unblock-time-slots (get equipment-id reservation-info) 
+                          (get start-time reservation-info) 
+                          (get end-time reservation-info)))
+    (ok refund-amount)))
+
+(define-public (set-equipment-maintenance (equipment-id uint) (start-time uint) (end-time uint))
+  (let 
+    (
+      (equipment-info (unwrap! (map-get? lab-equipment equipment-id) ERR-EQUIPMENT-NOT-FOUND))
+      (lab-info (unwrap! (map-get? labs (get lab-id equipment-info)) ERR-INVALID-LAB))
+    )
+    (asserts! (is-eq tx-sender (get owner lab-info)) ERR-NOT-TOKEN-OWNER)
+    (asserts! (< start-time end-time) ERR-INVALID-TIME-SLOT)
+    (map-set lab-equipment equipment-id 
+      (merge equipment-info 
+        (tuple (maintenance-start start-time) (maintenance-end end-time))))
+    (ok true)))
+
+(define-public (toggle-equipment-status (equipment-id uint))
+  (let 
+    (
+      (equipment-info (unwrap! (map-get? lab-equipment equipment-id) ERR-EQUIPMENT-NOT-FOUND))
+      (lab-info (unwrap! (map-get? labs (get lab-id equipment-info)) ERR-INVALID-LAB))
+    )
+    (asserts! (is-eq tx-sender (get owner lab-info)) ERR-NOT-TOKEN-OWNER)
+    (map-set lab-equipment equipment-id 
+      (merge equipment-info (tuple (available (not (get available equipment-info))))))
+    (ok true)))
+
+(define-public (modify-reservation (reservation-id uint) (new-start-time uint) (new-duration-hours uint))
+  (let 
+    (
+      (reservation-info (unwrap! (map-get? equipment-reservations reservation-id) ERR-RESERVATION-NOT-FOUND))
+      (equipment-info (unwrap! (map-get? lab-equipment (get equipment-id reservation-info)) ERR-EQUIPMENT-NOT-FOUND))
+      (lab-info (unwrap! (map-get? labs (get lab-id equipment-info)) ERR-INVALID-LAB))
+      (new-end-time (+ new-start-time (* new-duration-hours u144)))
+      (new-total-cost (* (get hourly-rate equipment-info) new-duration-hours))
+      (cost-difference (if (> new-total-cost (get total-cost reservation-info))
+                        (- new-total-cost (get total-cost reservation-info))
+                        u0))
+    )
+    (asserts! (is-eq (get user reservation-info) tx-sender) ERR-NOT-TOKEN-OWNER)
+    (asserts! (is-eq (get status reservation-info) u1) ERR-RESERVATION-EXPIRED)
+    (asserts! (> (get start-time reservation-info) stacks-block-height) ERR-RESERVATION-EXPIRED)
+    (asserts! (<= new-duration-hours (get max-reservation-hours equipment-info)) ERR-INVALID-TIME-SLOT)
+    (asserts! (> new-start-time stacks-block-height) ERR-INVALID-TIME-SLOT)
+    (begin
+      (unblock-time-slots (get equipment-id reservation-info) 
+                          (get start-time reservation-info) 
+                          (get end-time reservation-info))
+      (asserts! (is-time-slot-available (get equipment-id reservation-info) new-start-time new-end-time) ERR-RESERVATION-CONFLICT))
+    (if (> cost-difference u0)
+      (try! (stx-transfer? cost-difference tx-sender (get owner lab-info)))
+      (if (< new-total-cost (get total-cost reservation-info))
+        (try! (stx-transfer? (- (get total-cost reservation-info) new-total-cost) 
+                            (get owner lab-info) tx-sender))
+        true))
+    (map-set equipment-reservations reservation-id
+      (merge reservation-info
+        (tuple 
+          (start-time new-start-time)
+          (end-time new-end-time)
+          (total-cost new-total-cost))))
+    (begin 
+      (block-time-slots (get equipment-id reservation-info) new-start-time new-end-time reservation-id))
+    (ok true)))
+
 ;; read only functions
 (define-read-only (get-last-token-id)
   (ok (var-get last-token-id)))
@@ -208,9 +390,106 @@
 (define-read-only (get-lab-count)
   (var-get lab-count))
 
+(define-read-only (get-equipment-info (equipment-id uint))
+  (map-get? lab-equipment equipment-id))
+
+(define-read-only (get-reservation-info (reservation-id uint))
+  (map-get? equipment-reservations reservation-id))
+
+(define-read-only (get-user-reservations (user principal))
+  (default-to (list) (map-get? user-reservations user)))
+
+(define-read-only (get-equipment-count)
+  (var-get equipment-count))
+
+(define-read-only (get-reservation-count)
+  (var-get reservation-count))
+
+(define-read-only (is-equipment-available (equipment-id uint) (start-time uint) (end-time uint))
+  (let 
+    (
+      (equipment-info (default-to 
+        (tuple (name "") (lab-id u0) (hourly-rate u0) (available false) 
+               (maintenance-start u0) (maintenance-end u0) (max-reservation-hours u0) (requires-training false))
+        (map-get? lab-equipment equipment-id)))
+    )
+    (and 
+      (get available equipment-info)
+      (not (is-in-maintenance equipment-id start-time end-time))
+      (is-time-slot-available equipment-id start-time end-time))))
+
+(define-read-only (get-equipment-by-lab (lab-id uint))
+  (ok lab-id))
+
 ;; private functions
 (define-private (is-owner (token-id uint) (user principal))
   (is-eq user (unwrap! (nft-get-owner? labpass token-id) false)))
+
+(define-private (is-in-maintenance (equipment-id uint) (start-time uint) (end-time uint))
+  (let 
+    (
+      (equipment-info (default-to 
+        (tuple (name "") (lab-id u0) (hourly-rate u0) (available false) 
+               (maintenance-start u0) (maintenance-end u0) (max-reservation-hours u0) (requires-training false))
+        (map-get? lab-equipment equipment-id)))
+      (maintenance-start (get maintenance-start equipment-info))
+      (maintenance-end (get maintenance-end equipment-info))
+    )
+    (and 
+      (> maintenance-end u0)
+      (or 
+        (and (>= start-time maintenance-start) (<= start-time maintenance-end))
+        (and (>= end-time maintenance-start) (<= end-time maintenance-end))
+        (and (< start-time maintenance-start) (> end-time maintenance-end))))))
+
+(define-private (is-time-slot-available (equipment-id uint) (start-time uint) (end-time uint))
+  (let 
+    (
+      (slot-1 (default-to (tuple (reserved false) (reservation-id u0)) 
+                (map-get? equipment-schedule (tuple (equipment-id equipment-id) (time-slot start-time)))))
+      (slot-2 (default-to (tuple (reserved false) (reservation-id u0)) 
+                (map-get? equipment-schedule (tuple (equipment-id equipment-id) (time-slot (+ start-time u144))))))
+      (slot-3 (default-to (tuple (reserved false) (reservation-id u0)) 
+                (map-get? equipment-schedule (tuple (equipment-id equipment-id) (time-slot (+ start-time u288))))))
+    )
+    (and 
+      (not (get reserved slot-1))
+      (not (get reserved slot-2))
+      (not (get reserved slot-3)))))
+
+(define-private (block-time-slots (equipment-id uint) (start-time uint) (end-time uint) (reservation-id uint))
+  (let 
+    (
+      (duration-blocks (/ (- end-time start-time) u144))
+    )
+    (map-set equipment-schedule 
+      (tuple (equipment-id equipment-id) (time-slot start-time))
+      (tuple (reserved true) (reservation-id reservation-id)))
+    (if (> duration-blocks u1)
+      (map-set equipment-schedule 
+        (tuple (equipment-id equipment-id) (time-slot (+ start-time u144)))
+        (tuple (reserved true) (reservation-id reservation-id)))
+      true)
+    (if (> duration-blocks u2)
+      (map-set equipment-schedule 
+        (tuple (equipment-id equipment-id) (time-slot (+ start-time u288)))
+        (tuple (reserved true) (reservation-id reservation-id)))
+      true)
+    true))
+
+(define-private (unblock-time-slots (equipment-id uint) (start-time uint) (end-time uint))
+  (let 
+    (
+      (duration-blocks (/ (- end-time start-time) u144))
+    )
+    (map-delete equipment-schedule (tuple (equipment-id equipment-id) (time-slot start-time)))
+    (if (> duration-blocks u1)
+      (map-delete equipment-schedule (tuple (equipment-id equipment-id) (time-slot (+ start-time u144))))
+      true)
+    (if (> duration-blocks u2)
+      (map-delete equipment-schedule (tuple (equipment-id equipment-id) (time-slot (+ start-time u288))))
+      true)
+    true))
 
 (define-trait commission-trait
   (
