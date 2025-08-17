@@ -25,6 +25,12 @@
 (define-constant ERR-EQUIPMENT-MAINTENANCE (err u116))
 (define-constant ERR-RESERVATION-EXPIRED (err u117))
 (define-constant ERR-EQUIPMENT-INACTIVE (err u118))
+(define-constant ERR-CERTIFICATION-NOT-FOUND (err u119))
+(define-constant ERR-CERTIFICATION-EXPIRED (err u120))
+(define-constant ERR-INSUFFICIENT-CERTIFICATIONS (err u121))
+(define-constant ERR-NOT-AUTHORIZED-INSTRUCTOR (err u122))
+(define-constant ERR-CERTIFICATION-ALREADY-EXISTS (err u123))
+(define-constant ERR-INVALID-CERTIFICATION (err u124))
 
 ;; data vars
 (define-data-var last-token-id uint u0)
@@ -32,6 +38,7 @@
 (define-data-var commission uint u250)
 (define-data-var equipment-count uint u0)
 (define-data-var reservation-count uint u0)
+(define-data-var certification-count uint u0)
 
 ;; data maps
 (define-map token-count principal uint)
@@ -88,6 +95,32 @@
   (tuple (equipment-id uint) (time-slot uint))
   (tuple (reserved bool) (reservation-id uint)))
 
+(define-map safety-certifications uint
+  (tuple
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (validity-months uint)
+    (required-for-labs (list 20 uint))
+    (required-for-equipment (list 20 uint))
+    (created-by principal)
+    (active bool)))
+
+(define-map user-certifications 
+  (tuple (user principal) (certification-id uint))
+  (tuple
+    (issued-at uint)
+    (expires-at uint)
+    (issued-by principal)
+    (status uint)))
+
+(define-map authorized-instructors principal (list 20 uint))
+
+(define-map lab-certification-requirements uint (list 10 uint))
+
+(define-map equipment-certification-requirements uint (list 10 uint))
+
+(define-map user-certification-history principal (list 100 uint))
+
 ;; public functions
 (define-public (create-lab (name (string-ascii 64)) (price-per-hour uint) (max-access-level uint))
   (let 
@@ -138,6 +171,7 @@
     (asserts! (is-eq (get lab-id pass-info) lab-id) ERR-INVALID-LAB)
     (asserts! (< stacks-block-height (get expiry-block pass-info)) ERR-PASS-EXPIRED)
     (asserts! (get active lab-info) ERR-INVALID-LAB)
+    (asserts! (has-required-certifications tx-sender lab-id) ERR-INSUFFICIENT-CERTIFICATIONS)
     (map-set lab-access-log 
       (tuple (lab-id lab-id) (pass-id pass-id) (user tx-sender))
       (tuple (access-time stacks-block-height) (duration u1)))
@@ -246,6 +280,7 @@
     (asserts! (< stacks-block-height (get expiry-block pass-info)) ERR-PASS-EXPIRED)
     (asserts! (get available equipment-info) ERR-EQUIPMENT-UNAVAILABLE)
     (asserts! (not (is-in-maintenance equipment-id start-time end-time)) ERR-EQUIPMENT-MAINTENANCE)
+    (asserts! (has-equipment-certifications tx-sender equipment-id) ERR-INSUFFICIENT-CERTIFICATIONS)
     (asserts! (<= duration-hours (get max-reservation-hours equipment-info)) ERR-INVALID-TIME-SLOT)
     (asserts! (> start-time stacks-block-height) ERR-INVALID-TIME-SLOT)
     (asserts! (is-time-slot-available equipment-id start-time end-time) ERR-RESERVATION-CONFLICT)
@@ -355,6 +390,120 @@
       (block-time-slots (get equipment-id reservation-info) new-start-time new-end-time reservation-id))
     (ok true)))
 
+(define-public (create-safety-certification (name (string-ascii 64)) (description (string-ascii 256)) (validity-months uint))
+  (let 
+    (
+      (certification-id (+ (var-get certification-count) u1))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (map-set safety-certifications certification-id
+      (tuple
+        (name name)
+        (description description)
+        (validity-months validity-months)
+        (required-for-labs (list))
+        (required-for-equipment (list))
+        (created-by tx-sender)
+        (active true)))
+    (var-set certification-count certification-id)
+    (ok certification-id)))
+
+(define-public (authorize-instructor (instructor principal) (certification-ids (list 20 uint)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (map-set authorized-instructors instructor certification-ids)
+    (ok true)))
+
+(define-public (issue-certification (user principal) (certification-id uint))
+  (let 
+    (
+      (cert-info (unwrap! (map-get? safety-certifications certification-id) ERR-CERTIFICATION-NOT-FOUND))
+      (instructor-certs (default-to (list) (map-get? authorized-instructors tx-sender)))
+      (validity-blocks (* (get validity-months cert-info) u4320))
+      (expires-at (+ stacks-block-height validity-blocks))
+    )
+    (asserts! (get active cert-info) ERR-INVALID-CERTIFICATION)
+    (asserts! (is-some (index-of instructor-certs certification-id)) ERR-NOT-AUTHORIZED-INSTRUCTOR)
+    (asserts! (is-none (map-get? user-certifications (tuple (user user) (certification-id certification-id)))) ERR-CERTIFICATION-ALREADY-EXISTS)
+    (map-set user-certifications 
+      (tuple (user user) (certification-id certification-id))
+      (tuple
+        (issued-at stacks-block-height)
+        (expires-at expires-at)
+        (issued-by tx-sender)
+        (status u1)))
+    (let 
+      (
+        (current-history (default-to (list) (map-get? user-certification-history user)))
+      )
+      (map-set user-certification-history user 
+        (unwrap-panic (as-max-len? (append current-history certification-id) u100))))
+    (ok true)))
+
+(define-public (revoke-certification (user principal) (certification-id uint))
+  (let 
+    (
+      (cert-record (unwrap! (map-get? user-certifications (tuple (user user) (certification-id certification-id))) ERR-CERTIFICATION-NOT-FOUND))
+      (instructor-certs (default-to (list) (map-get? authorized-instructors tx-sender)))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get issued-by cert-record))
+      (is-eq tx-sender CONTRACT-OWNER)
+      (is-some (index-of instructor-certs certification-id))) ERR-NOT-AUTHORIZED-INSTRUCTOR)
+    (map-set user-certifications 
+      (tuple (user user) (certification-id certification-id))
+      (merge cert-record (tuple (status u3))))
+    (ok true)))
+
+(define-public (renew-certification (user principal) (certification-id uint))
+  (let 
+    (
+      (cert-info (unwrap! (map-get? safety-certifications certification-id) ERR-CERTIFICATION-NOT-FOUND))
+      (cert-record (unwrap! (map-get? user-certifications (tuple (user user) (certification-id certification-id))) ERR-CERTIFICATION-NOT-FOUND))
+      (instructor-certs (default-to (list) (map-get? authorized-instructors tx-sender)))
+      (validity-blocks (* (get validity-months cert-info) u4320))
+      (new-expires-at (+ stacks-block-height validity-blocks))
+    )
+    (asserts! (get active cert-info) ERR-INVALID-CERTIFICATION)
+    (asserts! (is-some (index-of instructor-certs certification-id)) ERR-NOT-AUTHORIZED-INSTRUCTOR)
+    (asserts! (is-eq (get status cert-record) u1) ERR-INVALID-CERTIFICATION)
+    (map-set user-certifications 
+      (tuple (user user) (certification-id certification-id))
+      (merge cert-record 
+        (tuple 
+          (issued-at stacks-block-height)
+          (expires-at new-expires-at))))
+    (ok true)))
+
+(define-public (set-lab-certification-requirements (lab-id uint) (required-certs (list 10 uint)))
+  (let 
+    (
+      (lab-info (unwrap! (map-get? labs lab-id) ERR-INVALID-LAB))
+    )
+    (asserts! (is-eq tx-sender (get owner lab-info)) ERR-NOT-TOKEN-OWNER)
+    (map-set lab-certification-requirements lab-id required-certs)
+    (ok true)))
+
+(define-public (set-equipment-certification-requirements (equipment-id uint) (required-certs (list 10 uint)))
+  (let 
+    (
+      (equipment-info (unwrap! (map-get? lab-equipment equipment-id) ERR-EQUIPMENT-NOT-FOUND))
+      (lab-info (unwrap! (map-get? labs (get lab-id equipment-info)) ERR-INVALID-LAB))
+    )
+    (asserts! (is-eq tx-sender (get owner lab-info)) ERR-NOT-TOKEN-OWNER)
+    (map-set equipment-certification-requirements equipment-id required-certs)
+    (ok true)))
+
+(define-public (toggle-certification-status (certification-id uint))
+  (let 
+    (
+      (cert-info (unwrap! (map-get? safety-certifications certification-id) ERR-CERTIFICATION-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (map-set safety-certifications certification-id 
+      (merge cert-info (tuple (active (not (get active cert-info))))))
+    (ok true)))
+
 ;; read only functions
 (define-read-only (get-last-token-id)
   (ok (var-get last-token-id)))
@@ -420,6 +569,42 @@
 
 (define-read-only (get-equipment-by-lab (lab-id uint))
   (ok lab-id))
+
+(define-read-only (get-certification-info (certification-id uint))
+  (map-get? safety-certifications certification-id))
+
+(define-read-only (get-user-certification (user principal) (certification-id uint))
+  (map-get? user-certifications (tuple (user user) (certification-id certification-id))))
+
+(define-read-only (get-user-certification-history (user principal))
+  (default-to (list) (map-get? user-certification-history user)))
+
+(define-read-only (get-authorized-instructor-certs (instructor principal))
+  (default-to (list) (map-get? authorized-instructors instructor)))
+
+(define-read-only (get-lab-certification-requirements (lab-id uint))
+  (default-to (list) (map-get? lab-certification-requirements lab-id)))
+
+(define-read-only (get-equipment-certification-requirements (equipment-id uint))
+  (default-to (list) (map-get? equipment-certification-requirements equipment-id)))
+
+(define-read-only (get-certification-count)
+  (var-get certification-count))
+
+(define-read-only (is-certification-valid (user principal) (certification-id uint))
+  (match (map-get? user-certifications (tuple (user user) (certification-id certification-id)))
+    cert-record (and 
+      (is-eq (get status cert-record) u1)
+      (< stacks-block-height (get expires-at cert-record)))
+    false))
+
+(define-read-only (user-has-valid-certifications (user principal) (required-certs (list 10 uint)))
+  (check-all-certifications user required-certs))
+
+(define-read-only (check-certification-status (user principal) (cert-id uint) (valid bool))
+  (if valid
+    (is-certification-valid user cert-id)
+    false))
 
 ;; private functions
 (define-private (is-owner (token-id uint) (user principal))
@@ -491,7 +676,41 @@
       true)
     true))
 
+(define-private (has-required-certifications (user principal) (lab-id uint))
+  (let 
+    (
+      (required-certs (default-to (list) (map-get? lab-certification-requirements lab-id)))
+    )
+    (if (is-eq (len required-certs) u0)
+      true
+      (check-all-certifications user required-certs))))
+
+(define-private (has-equipment-certifications (user principal) (equipment-id uint))
+  (let 
+    (
+      (required-certs (default-to (list) (map-get? equipment-certification-requirements equipment-id)))
+    )
+    (if (is-eq (len required-certs) u0)
+      true
+      (check-all-certifications user required-certs))))
+
+(define-private (check-all-certifications (user principal) (cert-list (list 10 uint)))
+  (let 
+    (
+      (first-cert (unwrap! (element-at cert-list u0) true))
+      (second-cert (element-at cert-list u1))
+      (third-cert (element-at cert-list u2))
+    )
+    (and 
+      (is-certification-valid user first-cert)
+      (match second-cert cert-id (is-certification-valid user cert-id) true)
+      (match third-cert cert-id (is-certification-valid user cert-id) true))))
+
 (define-trait commission-trait
   (
     (pay (uint uint) (response bool uint))
   ))
+
+
+
+  
